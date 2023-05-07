@@ -39,8 +39,8 @@ import System.FSNotify
 import System.FilePath (isRelative, makeRelative)
 import System.FilePattern (FilePattern, (?==))
 import System.FilePattern.Directory (getDirectoryFilesIgnore)
-import UnliftIO (MonadUnliftIO, finally, newTBQueueIO, race, try, withRunInIO, writeTBQueue)
-import UnliftIO.STM (TBQueue, readTBQueue)
+import UnliftIO (MonadUnliftIO, finally, flushTBQueue, newTBQueueIO, race, try, unGetTBQueue, withRunInIO, writeTBQueue)
+import UnliftIO.STM (TBQueue, peekTBQueue, tryReadTBQueue)
 
 -- | Simplified version of `unionMount` with exactly one layer.
 mount ::
@@ -144,6 +144,8 @@ data Cmd
   = Cmd_Remount
   deriving (Eq, Show)
 
+type ActionBundle x = (x, FilePath, Either (FolderAction ()) (FileAction ()))
+
 -- | Like `unionMount` but without exception interrupting or re-mounting.
 unionMount' ::
   forall source tag m m1.
@@ -164,7 +166,7 @@ unionMount' ::
       m Cmd
     )
 unionMount' sources pats ignore = do
-  fmap fst . flip runStateT (emptyOverlayFs @source) $ do
+  flip evalStateT (emptyOverlayFs @source) $ do
     -- Initial traversal of sources
     changes0 :: Change source tag <-
       fmap snd . flip runStateT Map.empty $ do
@@ -178,34 +180,60 @@ unionMount' sources pats ignore = do
       ( changes0,
         \reportChange -> do
           -- Run fsnotify on sources
-          q :: TBQueue (x, FilePath, Either (FolderAction ()) (FileAction ())) <- liftIO $ newTBQueueIO 1
+          q :: TBQueue (ActionBundle x) <- newTBQueueIO 1000 -- max number of items to merge
           fmap (either id id) $
             race (onChange q (toList sources)) $
-              fmap fst . flip runStateT ofs $ do
-                let loop = do
-                      (src, fp, actE) <- atomically $ readTBQueue q
-                      let shouldIgnore = any (?== fp) ignore
-                      case actE of
-                        Left _ -> do
-                          let reason = "Unhandled folder event on '" <> toText fp <> "'"
-                          if shouldIgnore
-                            then do
-                              log LevelWarn $ reason <> " on an ignored path"
-                              loop
-                            else do
-                              -- We don't know yet how to deal with folder events. Just reboot the mount.
-                              log LevelWarn $ reason <> "; suggesting a re-mount"
-                              pure Cmd_Remount -- Exit, asking user to remokunt
-                        Right act -> do
-                          case guard (not shouldIgnore) >> getTag pats fp of
-                            Nothing -> loop
-                            Just tag -> do
-                              changes <- fmap snd . flip runStateT Map.empty $ do
-                                put =<< lift . changeInsert src tag fp act =<< get
-                              lift $ reportChange changes
-                              loop
-                loop
+              let readDebounced = do
+                    _ <- atomically $ peekTBQueue q
+                    -- Wait for some initial action in the queue.
+                    -- 100ms is a reasonable wait period to gather (possibly related) events.
+                    liftIO $ threadDelay 100000
+                    -- After this period, merge changes.
+                    -- If after merging the queue is empty again, retry.
+                    -- (this can happen if a file is created and deleted in this short span)
+                    item <- atomically $ do
+                      merged <- mergeActions <$> flushTBQueue q
+                      case merged of
+                        (x : xs) -> forM_ xs (writeTBQueue q) $> Just x
+                        _ -> return Nothing
+                    maybe readDebounced return item
+                  loop = do
+                    (src, fp, actE) <- readDebounced
+                    let shouldIgnore = any (?== fp) ignore
+                    case actE of
+                      Left _ -> do
+                        let reason = "Unhandled folder event on '" <> toText fp <> "'"
+                        if shouldIgnore
+                          then do
+                            log LevelWarn $ reason <> " on an ignored path"
+                            loop
+                          else do
+                            -- We don't know yet how to deal with folder events. Just reboot the mount.
+                            log LevelWarn $ reason <> "; suggesting a re-mount"
+                            pure Cmd_Remount -- Exit, asking user to remokunt
+                      Right act -> do
+                        case guard (not shouldIgnore) >> getTag pats fp of
+                          Nothing -> loop
+                          Just tag -> do
+                            changes <- fmap snd . flip runStateT Map.empty $ do
+                              put =<< lift . changeInsert src tag fp act =<< get
+                            lift $ reportChange changes
+                            loop
+               in evalStateT loop ofs
       )
+
+mergeActions :: (Eq x) => [ActionBundle x] -> [ActionBundle x]
+mergeActions = foldr go []
+  where
+    go (lastTag, lastFp, Right lastAction) ((newTag, newFp, Right newAction) : xs)
+      | lastTag == newTag && lastFp == newFp =
+          let f x = (newTag, newFp, Right x) : xs
+           in case (lastAction, newAction) of
+                (Delete, Refresh New ()) -> f $ Refresh Update ()
+                (Refresh New (), Refresh Update ()) -> f $ Refresh New ()
+                (Refresh New (), Delete) -> xs
+                _ -> f newAction
+    go x xs = x : xs
 
 filesMatching :: (MonadIO m, MonadLogger m) => FilePath -> [FilePattern] -> [FilePattern] -> m [FilePath]
 filesMatching parent' pats ignore = do
